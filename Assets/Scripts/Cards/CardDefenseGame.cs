@@ -9,7 +9,7 @@ using UnityEngine.InputSystem;
 public sealed class CardDefenseGame : MonoBehaviour
 {
     private enum Suit { Heart, Club, Spade, Diamond }
-    private enum EnemyKind { Basic, Runner, Tank }
+    private enum EnemyKind { Basic, Runner, Tank, Boss }
     private enum Upgrade { Damage, Speed, Size, Ana, Creal, Taffy, Pharah, Count }
     private const string AnaDisplayName = "ANA";
     private const string CrealDisplayName = "C,REAL";
@@ -27,8 +27,13 @@ public sealed class CardDefenseGame : MonoBehaviour
         public int MaxHealth;
         public int LastHitThrow;
         public RectTransform HealthFill;
+        public Text VulnerabilityText;
+        public int VulnerabilityStacks;
+        public float VulnerabilityExpiresAt;
+        public float VulnerabilityBonusRemainder;
         public float PullParticleTimer;
         public bool PharahLatched;
+        public Vector2 KnockbackVelocity;
     }
 
     private sealed class GravityMote
@@ -43,7 +48,22 @@ public sealed class CardDefenseGame : MonoBehaviour
     {
         public RectTransform Rect;
         public Vector2 Velocity;
+        public Suit SourceSuit;
+        public readonly HashSet<Enemy> HitEnemies = new HashSet<Enemy>();
     }
+
+    private sealed class CloneCard
+    {
+        public RectTransform Rect;
+        public Vector2 Velocity;
+        public int AttackPower;
+        public bool FastHit;
+        public int WallBounces;
+        public Suit SourceSuit;
+        public readonly HashSet<Enemy> HitEnemies = new HashSet<Enemy>();
+    }
+
+    private const int MaxCloneWallBounces = 3;
 
     [Header("씬 참조")]
     [SerializeField] private RectTransform canvasRect;
@@ -80,15 +100,14 @@ public sealed class CardDefenseGame : MonoBehaviour
     [SerializeField, Min(0.1f)] private float firstWaveSpawnInterval = 1.1f;
     [SerializeField, Min(1)] private int firstWaveEnemyCount = 7;
     [SerializeField, Min(1f)] private float waveEnemyCountMultiplier = 1.18f;
-    [SerializeField, Min(1f)] private float waveEnemyHealthMultiplier = 1.11f;
-    [SerializeField, Min(1f)] private float waveEnemySpeedMultiplier = 1.07f;
+    [SerializeField, Min(1f)] private float waveEnemyHealthMultiplier = 1.3f;
+    [SerializeField, Min(1f)] private float waveEnemySpeedMultiplier = 1.02f;
     [SerializeField, Range(0.01f, 1f)] private float waveSpawnIntervalMultiplier = 0.91f;
     [SerializeField, Min(0.01f)] private float minimumSpawnInterval = 0.18f;
     [SerializeField, Min(1)] private int maximumEnemiesPerWave = 200;
     [SerializeField, Min(1)] private int maximumAliveEnemies = 60;
-    [SerializeField, Min(1)] private int maximumEnemyHealth = 40;
-    [SerializeField, Min(1f)] private float maximumEnemySpeedMultiplier = 3.5f;
-    [SerializeField, Min(0f)] private float suitMenuMaxCardSpeed = 850f;
+    [SerializeField, Min(1)] private int maximumEnemyHealth = 120;
+    [SerializeField, Min(1f)] private float maximumEnemySpeedMultiplier = 1.5f;
 
     [Header("코인 보상")]
     [SerializeField, Min(1)] private int baseCoinsPerKill = 1;
@@ -110,12 +129,12 @@ public sealed class CardDefenseGame : MonoBehaviour
     [SerializeField, Min(0f)] private float pharahPullRadius = 250f;
     [SerializeField, Min(1f)] private float pharahLatchedRadiusMultiplier = 2.5f;
     [SerializeField, Min(0f)] private float pharahPullSpeed = 300f;
-    [SerializeField, Min(1f)] private float taffyGrabRangeMultiplier = 1.5f;
-    [SerializeField, Min(1)] private int anaKillsPerBurst = 5;
+    [SerializeField, Min(1)] private int anaHitsPerBurst = 7;
+    [SerializeField, Min(1)] private int paraHitsPerBurst = 7;
     [SerializeField, Min(1)] private int anaMiniCardCount = 6;
     [SerializeField, Min(0f)] private float anaMiniCardSpeed = 480f;
     [SerializeField, Min(1f)] private float serialSpeedMultiplier = 1.1f;
-    [SerializeField, Min(1)] private int serialMaxStacks = 12;
+    [SerializeField, Min(1)] private int serialMaxStacks = 6;
 
     [Header("효과음")]
     [SerializeField] private AudioClip hitSound;
@@ -126,8 +145,9 @@ public sealed class CardDefenseGame : MonoBehaviour
     [Header("카드 능력 효과음")]
     [SerializeField, InspectorName("ANA · 폭발")] private AudioClip anaAbilitySound;
     [SerializeField, InspectorName("C,REAL · 속도 증가")] private AudioClip crealAbilitySound;
-    [SerializeField, InspectorName("TAPIE · 공전 시작")] private AudioClip tapieAbilitySound;
+    [SerializeField, InspectorName("TAPIE · 벽 반사 복제")] private AudioClip tapieAbilitySound;
     [SerializeField, InspectorName("PARA · 적 끌어당김")] private AudioClip paraAbilitySound;
+    [SerializeField, InspectorName("PARA · 폭발")] private AudioClip paraBurstSound;
     [SerializeField, Range(0f, 1f), InspectorName("능력 효과음 볼륨")]
     private float abilitySoundVolume = 0.7f;
 
@@ -142,8 +162,10 @@ public sealed class CardDefenseGame : MonoBehaviour
 
     private readonly List<Enemy> enemies = new List<Enemy>();
     private readonly List<MiniCard> miniCards = new List<MiniCard>();
+    private readonly List<CloneCard> cloneCards = new List<CloneCard>();
     private readonly GravityMote[] gravityMotes = new GravityMote[64];
-    private const int MaxUpgradeLevel = 10;
+    private const int AbilityUnlockLevel = 10;
+    private const int MaxAbilityLevel = 20;
     private readonly int[] upgradeLevels = new int[(int)Upgrade.Count];
     private readonly Text[] upgradeLabels = new Text[(int)Upgrade.Count];
     private readonly Text[] upgradePrices = new Text[(int)Upgrade.Count];
@@ -169,15 +191,27 @@ public sealed class CardDefenseGame : MonoBehaviour
     private int score;
     private int coins;
     private Text coinText;
+    private readonly long[] suitDamage = new long[4];
+    [SerializeField] private Text[] suitDamageTexts = new Text[4];
+    [SerializeField] private Image[] suitDamageFills = new Image[4];
+    [SerializeField] private RectTransform damageHudPanel;
+    private CanvasGroup damageHudGroup;
+    private CanvasGroup[] damageHudContentGroups;
+    private RectTransform[] damageHudContents;
+    private Vector2[] damageHudShownPositions;
+    private float damageHudReveal;
     private Text finalScoreText;
     public int Coins => coins;
     private int coreHealth;
+    private bool debugInvincible;
     private float coreRegenTimer;
     private Image coreHealthFill;
     private int combo;
     private int wallBounces;
     private int throwSequence;
-    private int anaKillCount;
+    private int anaHitCount;
+    private int paraHitCount;
+    private bool paraBurstReady;
     private int serialStacks;
     private float nextSpawnTime;
     private float nextWaveTime;
@@ -190,7 +224,12 @@ public sealed class CardDefenseGame : MonoBehaviour
     private float shakeStrength;
     private AudioSource audioSource;
     private AudioSource abilityAudioSource;
+    private Sprite paraShockwaveSprite;
+    private Texture2D paraShockwaveTexture;
     private float nextParaAbilitySoundTime;
+    private float nextHitSoundTime;
+    private float nextBounceSoundTime;
+    private float nextAbilitySoundTime;
     private Coroutine hitPause;
     private bool hitPauseActive;
     private Image aimDimmer;
@@ -277,12 +316,27 @@ public sealed class CardDefenseGame : MonoBehaviour
         cardThrow.Released += OnReleased;
         cardThrow.Thrown += OnThrown;
         cardThrow.WallBounced += OnWallBounced;
-        cardThrow.OrbitStarted += OnOrbitStarted;
         coreBaseColor = coreImage.color;
         coreHealth = startingCoreHealth;
         coins = 0;
         CreateCoinHud();
         UpdateCoinHud();
+        UpdateDamageHud();
+        damageHudGroup = damageHudPanel.GetComponent<CanvasGroup>();
+        damageHudContents = new RectTransform[damageHudPanel.childCount];
+        damageHudContentGroups = new CanvasGroup[damageHudContents.Length];
+        damageHudShownPositions = new Vector2[damageHudContents.Length];
+        for (int i = 0; i < damageHudContents.Length; i++)
+        {
+            damageHudContents[i] = damageHudPanel.GetChild(i) as RectTransform;
+            damageHudContentGroups[i] = damageHudContents[i].GetComponent<CanvasGroup>();
+            damageHudShownPositions[i] = damageHudContents[i].anchoredPosition;
+            damageHudContents[i].anchoredPosition += Vector2.left * 55f;
+            damageHudContentGroups[i].alpha = 0f;
+            damageHudContentGroups[i].blocksRaycasts = false;
+        }
+        damageHudGroup.alpha = 1f;
+        damageHudGroup.blocksRaycasts = false;
         CreateCoreHealthBar();
         UpdateCoreHealthBar();
         CreateAimDimmer();
@@ -303,12 +357,13 @@ public sealed class CardDefenseGame : MonoBehaviour
     private void OnDestroy()
     {
         Time.timeScale = 1f;
+        if (paraShockwaveSprite != null) Destroy(paraShockwaveSprite);
+        if (paraShockwaveTexture != null) Destroy(paraShockwaveTexture);
         if (cardThrow == null) return;
         cardThrow.Grabbed -= OnGrabbed;
         cardThrow.Released -= OnReleased;
         cardThrow.Thrown -= OnThrown;
         cardThrow.WallBounced -= OnWallBounced;
-        cardThrow.OrbitStarted -= OnOrbitStarted;
     }
 
     private void OnDisable()
@@ -328,6 +383,7 @@ public sealed class CardDefenseGame : MonoBehaviour
         UpdateEnemies();
         UpdateGravityMotes();
         UpdateSkillTreeHover();
+        UpdateDamageHudHover();
         UpdateSuitMenu();
         UpdateShake();
         UpdateHud();
@@ -364,15 +420,14 @@ public sealed class CardDefenseGame : MonoBehaviour
     {
         if (gameOver) return;
         CheckCardHits();
+        UpdateCloneCards();
         UpdateMiniCards();
         UpdateFlight();
     }
 
     public void SelectSuit(int suit)
     {
-        if (suit < 0 || suit >= 4 || gameOver || cardThrow.IsDragging ||
-            cardThrow.IsOrbiting ||
-            cardThrow.IsFlying && cardThrow.Speed > suitMenuMaxCardSpeed) return;
+        if (suit < 0 || suit >= 4 || gameOver || cardThrow.IsDragging) return;
         if (selectedSuit != (Suit)suit) serialStacks = 0;
         selectedSuit = (Suit)suit;
         PickRandomCard();
@@ -387,16 +442,12 @@ public sealed class CardDefenseGame : MonoBehaviour
     private void PrepareCard()
     {
         ClearGravityMotes();
+        cardThrow.SetFlightSizeMultiplier(1f);
         wallBounces = 0;
         slowTime = 0f;
         float handY = -canvasRect.rect.height * 0.31f;
         cardThrow.Configure(1f + 0.08f * upgradeLevels[(int)Upgrade.Speed],
             1f + 0.06f * upgradeLevels[(int)Upgrade.Size], handY);
-        cardThrow.SetOrbitEnabled(selectedSuit == Suit.Club);
-        cardThrow.SetOrbitUpgrades(0.25f * upgradeLevels[(int)Upgrade.Taffy],
-            0.04f * upgradeLevels[(int)Upgrade.Taffy]);
-        cardThrow.SetGrabDistanceMultiplier(selectedSuit == Suit.Club
-            ? taffyGrabRangeMultiplier : 1f);
         Sprite sprite = selectedCardSprite;
         cardThrow.ReturnToHand(sprite, sprite == null ? new Color(0.98f, 0.98f, 1f) : Color.white);
         previousCardPosition = cardThrow.Position;
@@ -420,8 +471,7 @@ public sealed class CardDefenseGame : MonoBehaviour
     private void UpdateSuitMenu()
     {
         Mouse mouse = Mouse.current;
-        bool canOpen = !cardThrow.IsDragging && !cardThrow.IsOrbiting && mouse != null &&
-            (!cardThrow.IsFlying || cardThrow.Speed <= suitMenuMaxCardSpeed);
+        bool canOpen = !cardThrow.IsDragging && mouse != null;
         Vector2 screenPoint = mouse == null ? Vector2.zero : mouse.position.ReadValue();
         bool pointerOnMenu = false;
         if (canOpen && RectTransformUtility.ScreenPointToLocalPointInRectangle(
@@ -502,21 +552,86 @@ public sealed class CardDefenseGame : MonoBehaviour
     {
         if (!cardThrow.IsFlying || gameOver) return;
         wallBounces++;
-        audioSource.pitch = 0.9f + Mathf.Min(wallBounces, 7) * 0.05f;
-        audioSource.PlayOneShot(bounceSound, bounceVolume);
+        throwSequence++;
+        if (Time.unscaledTime >= nextBounceSoundTime)
+        {
+            audioSource.pitch = 0.9f + Mathf.Min(wallBounces, 7) * 0.05f;
+            audioSource.PlayOneShot(bounceSound, bounceVolume * 0.65f);
+            nextBounceSoundTime = Time.unscaledTime + 0.07f;
+        }
         if (wallBounces > 1)
             ShowPopup("벽 반사 " + wallBounces + "회", cardThrow.Position, SuitColors[(int)Suit.Spade]);
-    }
-
-    private void OnOrbitStarted()
-    {
-        if (selectedSuit == Suit.Club && !gameOver)
+        if (selectedSuit == Suit.Club && wallBounces % 2 == 0)
+        {
+            SpawnTaffyClones();
             PlayAbilitySound(tapieAbilitySound);
+        }
     }
 
-    private void PlayAbilitySound(AudioClip clip)
+    private void SpawnTaffyClones()
     {
-        if (clip != null) abilityAudioSource.PlayOneShot(clip, abilitySoundVolume);
+        Vector2 rebound = cardThrow.Velocity;
+        if (rebound.sqrMagnitude < 1f) return;
+        int count = upgradeLevels[(int)Upgrade.Taffy] >= AbilityUnlockLevel ? 2 : 1;
+        for (int i = 0; i < count; i++)
+        {
+            float angle = count == 1 ? ((wallBounces / 2) % 2 == 0 ? -20f : 20f)
+                : (i == 0 ? -20f : 20f);
+            Vector2 direction = Quaternion.Euler(0f, 0f, angle) * rebound.normalized;
+            RectTransform rect = CreateRect("TAPIE Clone", effectLayer,
+                cardThrow.CardRect.rect.size, cardThrow.Position);
+            rect.localScale = cardThrow.CardRect.localScale;
+            rect.localRotation = cardThrow.CardRect.localRotation;
+            Vector2 limit = GetCardCenterLimit(rect) - Vector2.one * 4f;
+            limit = Vector2.Max(Vector2.zero, limit);
+            Vector2 start = cardThrow.Position + direction * 8f;
+            rect.anchoredPosition = new Vector2(
+                Mathf.Clamp(start.x, -limit.x, limit.x),
+                Mathf.Clamp(start.y, -limit.y, limit.y));
+            Image image = rect.gameObject.AddComponent<Image>();
+            image.sprite = cardThrow.CardImage.sprite;
+            Color cardColor = cardThrow.CardImage.color;
+            image.color = new Color(cardColor.r, cardColor.g, cardColor.b, cardColor.a * 0.5f);
+            image.preserveAspect = true;
+            image.raycastTarget = false;
+            cloneCards.Add(new CloneCard
+            {
+                Rect = rect,
+                Velocity = direction * Mathf.Max(300f, cardThrow.Speed) *
+                    (1f + 0.04f * Mathf.Min(upgradeLevels[(int)Upgrade.Taffy], AbilityUnlockLevel)),
+                AttackPower = Mathf.Max(1, Mathf.CeilToInt(
+                    (1 + upgradeLevels[(int)Upgrade.Damage]) * 0.5f)) +
+                    Mathf.Max(0, upgradeLevels[(int)Upgrade.Taffy] - AbilityUnlockLevel),
+                FastHit = cardThrow.Speed >= cardThrow.TrailMinSpeed,
+                SourceSuit = Suit.Club
+            });
+        }
+    }
+
+    private Vector2 GetCardCenterLimit(RectTransform rect)
+    {
+        float angle = rect.localEulerAngles.z * Mathf.Deg2Rad;
+        float cosine = Mathf.Abs(Mathf.Cos(angle));
+        float sine = Mathf.Abs(Mathf.Sin(angle));
+        Vector2 half = rect.rect.size * (rect.localScale.x * 0.5f);
+        Vector2 extent = new Vector2(cosine * half.x + sine * half.y,
+            sine * half.x + cosine * half.y);
+        return Vector2.Max(Vector2.zero, canvasRect.rect.size * 0.5f - extent);
+    }
+
+    private void PlayAbilitySound(AudioClip clip, bool priority = false)
+    {
+        if (clip == null || (!priority && Time.unscaledTime < nextAbilitySoundTime)) return;
+        abilityAudioSource.PlayOneShot(clip, abilitySoundVolume * 0.65f);
+        nextAbilitySoundTime = Time.unscaledTime + Mathf.Clamp(clip.length * 0.5f, 0.08f, 0.25f);
+    }
+
+    private void PlayHitSound()
+    {
+        if (Time.unscaledTime < nextHitSoundTime) return;
+        audioSource.pitch = Mathf.Min(1.65f, 0.92f + combo * 0.075f);
+        audioSource.PlayOneShot(hitSound, hitVolume * 0.65f);
+        nextHitSoundTime = Time.unscaledTime + Mathf.Clamp(hitSound.length * 0.5f, 0.06f, 0.14f);
     }
 
     private void PlayCardHandlingSound(AudioClip clip)
@@ -528,12 +643,6 @@ public sealed class CardDefenseGame : MonoBehaviour
     {
         if (!cardThrow.IsFlying || cardThrow.IsDragging) return;
         if (selectedSuit == Suit.Diamond) return;
-        if (cardThrow.IsOrbiting)
-        {
-            flightEndTime += Time.deltaTime;
-            slowTime = 0f;
-            return;
-        }
         slowTime = cardThrow.Speed < 55f ? slowTime + Time.deltaTime : 0f;
         if (Time.time >= flightEndTime || slowTime >= 1.2f) PrepareCard();
     }
@@ -568,13 +677,17 @@ public sealed class CardDefenseGame : MonoBehaviour
 
     private void SpawnEnemy()
     {
-        EnemyKind kind = wave >= 3 && waveSpawned % 7 == 6 ? EnemyKind.Tank
+        EnemyKind kind = wave % 5 == 0 && waveSpawned == waveTarget - 1 ? EnemyKind.Boss
+            : wave >= 3 && waveSpawned % 7 == 6 ? EnemyKind.Tank
             : wave >= 2 && waveSpawned % 4 == 3 ? EnemyKind.Runner : EnemyKind.Basic;
-        float radius = kind == EnemyKind.Tank ? 38f : kind == EnemyKind.Runner ? 21f : 29f;
-        float speed = (kind == EnemyKind.Runner ? 95f : kind == EnemyKind.Tank ? 31f : 52f)
+        float radius = kind == EnemyKind.Boss ? 64f : kind == EnemyKind.Tank ? 38f
+            : kind == EnemyKind.Runner ? 26f : 29f;
+        float speed = (kind == EnemyKind.Boss ? 18f : kind == EnemyKind.Runner ? 75f
+            : kind == EnemyKind.Tank ? 31f : 52f)
             * Mathf.Min(maximumEnemySpeedMultiplier,
                 Mathf.Pow(waveEnemySpeedMultiplier, wave - 1));
-        Color color = kind == EnemyKind.Tank ? new Color(0.72f, 0.39f, 1f)
+        Color color = kind == EnemyKind.Boss ? new Color(1f, 0.56f, 0.25f)
+            : kind == EnemyKind.Tank ? new Color(0.72f, 0.39f, 1f)
             : kind == EnemyKind.Runner ? new Color(1f, 0.77f, 0.31f)
             : new Color(1f, 0.42f, 0.43f);
         RectTransform rect = CreateRect(kind.ToString() + " Enemy", enemyLayer,
@@ -587,21 +700,24 @@ public sealed class CardDefenseGame : MonoBehaviour
             : side == 2 ? new Vector2(UnityEngine.Random.Range(-halfW, halfW), -halfH)
             : new Vector2(UnityEngine.Random.Range(-halfW, halfW), halfH);
         Image image = rect.gameObject.AddComponent<Image>();
-        Sprite enemySprite = kind == EnemyKind.Tank ? tankEnemySprite
+        Sprite enemySprite = kind == EnemyKind.Boss || kind == EnemyKind.Tank ? tankEnemySprite
             : kind == EnemyKind.Runner ? runnerEnemySprite : basicEnemySprite;
         image.sprite = enemySprite;
-        image.color = enemySprite == null ? color : Color.white;
+        image.color = kind == EnemyKind.Boss || enemySprite == null ? color : Color.white;
         image.preserveAspect = enemySprite != null;
         image.raycastTarget = false;
         if (enemySprite == null)
         {
-            Text glyph = MakeText(kind == EnemyKind.Tank ? "강" : kind == EnemyKind.Runner ? ">" : "X",
+            Text glyph = MakeText(kind == EnemyKind.Boss ? "BOSS" : kind == EnemyKind.Tank ? "강"
+                : kind == EnemyKind.Runner ? ">" : "X",
                 rect, 24, Color.white, TextAnchor.MiddleCenter);
             Stretch(glyph.rectTransform, 0f);
         }
-        int maxHealth = Mathf.Max(1, Mathf.CeilToInt(Mathf.Min(maximumEnemyHealth,
-            (kind == EnemyKind.Tank ? 3 : 2) *
-            Mathf.Pow(waveEnemyHealthMultiplier, wave - 1))));
+        int maxHealth = kind == EnemyKind.Boss
+            ? Mathf.CeilToInt(Mathf.Min(120f, 24f * Mathf.Pow(waveEnemyHealthMultiplier, wave - 1)))
+            : Mathf.Max(1, Mathf.CeilToInt(Mathf.Min(maximumEnemyHealth,
+                (kind == EnemyKind.Tank ? 3 : 1) *
+                Mathf.Pow(waveEnemyHealthMultiplier, Mathf.Max(0, wave - 3)))));
         RectTransform healthBar = CreateRect("Health Bar", rect,
             new Vector2(radius * 1.6f, 8f), new Vector2(0f, radius + 12f));
         Image healthBackground = healthBar.gameObject.AddComponent<Image>();
@@ -621,10 +737,17 @@ public sealed class CardDefenseGame : MonoBehaviour
         fillImage.pixelsPerUnitMultiplier = 6f;
         fillImage.color = new Color(0.42f, 0.95f, 0.55f);
         fillImage.raycastTarget = false;
+        Text vulnerabilityText = MakeText("약화", rect, 16,
+            SuitColors[(int)Suit.Diamond], TextAnchor.MiddleCenter);
+        vulnerabilityText.fontStyle = FontStyle.Bold;
+        vulnerabilityText.rectTransform.sizeDelta = new Vector2(90f, 22f);
+        vulnerabilityText.rectTransform.anchoredPosition = new Vector2(0f, radius + 34f);
+        vulnerabilityText.gameObject.SetActive(false);
         enemies.Add(new Enemy
         {
             Rect = rect, Image = image, Kind = kind, Speed = speed, Radius = radius,
             Health = maxHealth, MaxHealth = maxHealth, HealthFill = healthFill,
+            VulnerabilityText = vulnerabilityText,
             PullParticleTimer = Random.Range(0f, 0.08f)
         });
     }
@@ -634,6 +757,12 @@ public sealed class CardDefenseGame : MonoBehaviour
         for (int i = enemies.Count - 1; i >= 0; i--)
         {
             Enemy enemy = enemies[i];
+            if (enemy.VulnerabilityStacks > 0 && Time.time >= enemy.VulnerabilityExpiresAt)
+            {
+                enemy.VulnerabilityStacks = 0;
+                enemy.VulnerabilityBonusRemainder = 0f;
+                enemy.VulnerabilityText.gameObject.SetActive(false);
+            }
             Vector2 pos = enemy.Rect.anchoredPosition;
             Vector2 step = -pos.normalized * enemy.Speed * Time.deltaTime;
             pos += step;
@@ -655,7 +784,7 @@ public sealed class CardDefenseGame : MonoBehaviour
                     float strength = 1f - distance / Mathf.Max(1f, pullRadius);
                     Vector2 direction = towardCard / distance;
                     pos += direction * (pharahPullSpeed *
-                        (1f + 0.12f * upgradeLevels[(int)Upgrade.Pharah]) *
+                        (1f + 0.12f * Mathf.Min(upgradeLevels[(int)Upgrade.Pharah], AbilityUnlockLevel)) *
                         strength * strength * Time.deltaTime);
                     enemy.PullParticleTimer -= Time.deltaTime;
                     if (enemy.PullParticleTimer <= 0f)
@@ -667,19 +796,49 @@ public sealed class CardDefenseGame : MonoBehaviour
                 }
             }
             if (!pulled) enemy.PullParticleTimer = 0f;
+            if (enemy.KnockbackVelocity.sqrMagnitude > 1f)
+            {
+                pos += enemy.KnockbackVelocity * Time.deltaTime;
+                enemy.KnockbackVelocity *= Mathf.Exp(-3f * Time.deltaTime);
+                Vector2 limit = canvasRect.rect.size * 0.5f - Vector2.one * enemy.Radius;
+                pos = new Vector2(Mathf.Clamp(pos.x, -limit.x, limit.x),
+                    Mathf.Clamp(pos.y, -limit.y, limit.y));
+            }
             enemy.Rect.anchoredPosition = pos;
             if (enemy.Rect.anchoredPosition.magnitude > 58f) continue;
-            coreHealth = Mathf.Max(0, coreHealth - (enemy.Kind == EnemyKind.Tank ? 3 : 1));
-            coreRegenTimer = 0f;
-            UpdateCoreHealthBar();
-            corePulse = 1f;
-            coreDamageFlashRemaining = coreDamageFlashSeconds;
-            Shake(7f, 0.14f);
-            ShowPopup("코어 -" + (enemy.Kind == EnemyKind.Tank ? 3 : 1), Vector2.zero, Color.red);
+            if (!debugInvincible)
+            {
+                int coreDamage = enemy.Kind == EnemyKind.Boss ? 5 : enemy.Kind == EnemyKind.Tank ? 3 : 1;
+                coreHealth = Mathf.Max(0, coreHealth - coreDamage);
+                coreRegenTimer = 0f;
+                UpdateCoreHealthBar();
+                corePulse = 1f;
+                coreDamageFlashRemaining = coreDamageFlashSeconds;
+                Shake(7f, 0.14f);
+                ShowPopup("코어 -" + coreDamage, Vector2.zero, Color.red);
+            }
             Destroy(enemy.Rect.gameObject);
             enemies.RemoveAt(i);
             if (coreHealth == 0) EndGame();
         }
+    }
+
+    private void TriggerParaBurst()
+    {
+        Vector2 origin = cardThrow.Position;
+        float radius = Mathf.Max(1f, canvasRect.rect.size.magnitude);
+        int maxDamage = GetParaBurstMaxDamage();
+        PlayAbilitySound(paraBurstSound != null ? paraBurstSound : anaAbilitySound, true);
+        Shake(18f, 0.2f);
+        ShowPopup("파라 폭발!", origin, SuitColors[(int)Suit.Heart]);
+        StartCoroutine(ShowParaShockwave(origin, radius, maxDamage));
+    }
+
+    private int GetParaBurstMaxDamage()
+    {
+        return Mathf.Max(1, Mathf.CeilToInt(
+            (4 + upgradeLevels[(int)Upgrade.Damage]) * 0.5f)) +
+            Mathf.Max(0, upgradeLevels[(int)Upgrade.Pharah] - AbilityUnlockLevel);
     }
 
     private void CreateGravityMotes()
@@ -761,29 +920,126 @@ public sealed class CardDefenseGame : MonoBehaviour
             if (!SweptCardTouchesEnemy(previousCardPosition, currentPosition,
                 previousCardAngle, currentAngle, halfSize, visibleEnemyPosition, enemy.Radius)) continue;
             enemy.LastHitThrow = throwSequence;
-            bool killed = DamageEnemy(enemy,
-                cardThrow.Speed >= cardThrow.TrailMinSpeed ? enemy.MaxHealth :
-                1 + upgradeLevels[(int)Upgrade.Damage]);
+            int attackPower = 1 + upgradeLevels[(int)Upgrade.Damage];
+            if (selectedSuit == Suit.Diamond &&
+                upgradeLevels[(int)Upgrade.Creal] >= AbilityUnlockLevel)
+            {
+                int bonusLevel = upgradeLevels[(int)Upgrade.Creal] - AbilityUnlockLevel;
+                attackPower += Mathf.FloorToInt(cardThrow.Speed / 400f *
+                    (1f + 0.1f * bonusLevel));
+            }
+            bool killed = DamageEnemy(enemy, GetCardHitDamage(enemy, attackPower,
+                cardThrow.Speed >= cardThrow.TrailMinSpeed), selectedSuit);
+            if (!killed && selectedSuit == Suit.Diamond) ApplyCrealVulnerability(enemy);
             combo++;
             score += 100 + Mathf.Min(combo, 20) * 10;
-            audioSource.pitch = Mathf.Min(1.65f, 0.92f + combo * 0.075f);
-            audioSource.PlayOneShot(hitSound, hitVolume);
+            PlayHitSound();
             Shake(12f + Mathf.Min(combo, 10), 0.16f);
             if (hitPause == null) hitPause = StartCoroutine(HitPause());
             RegisterCrealHit();
+            RegisterCardHit();
             ShowPopup(killed ? (combo > 1 ? "콤보 " + combo + "회" : "명중!") : "타격",
                 enemy.Rect.anchoredPosition, Color.black);
             ShowCombo();
             flightEndTime = Mathf.Min(Time.time + 9f, flightEndTime + 0.5f);
-            if (killed) DefeatEnemy(i, true);
+            if (killed) DefeatEnemy(i);
+        }
+        if (paraBurstReady)
+        {
+            paraBurstReady = false;
+            TriggerParaBurst();
         }
         previousCardPosition = currentPosition;
         previousCardAngle = currentAngle;
     }
 
-    private bool DamageEnemy(Enemy enemy, int damage)
+    private static int GetCardHitDamage(Enemy enemy, int attackPower, bool fastHit)
     {
+        return fastHit && enemy.Health < attackPower * 2 ? enemy.Health : attackPower;
+    }
+
+    private void UpdateCloneCards()
+    {
+        float dt = Time.deltaTime;
+        for (int j = cloneCards.Count - 1; j >= 0; j--)
+        {
+            CloneCard clone = cloneCards[j];
+            Vector2 start = clone.Rect.anchoredPosition;
+            float startAngle = clone.Rect.localEulerAngles.z;
+            Vector2 end = start + clone.Velocity * dt;
+            clone.Rect.Rotate(0f, 0f, 700f * dt);
+            float endAngle = clone.Rect.localEulerAngles.z;
+            Vector2 limit = GetCardCenterLimit(clone.Rect);
+            bool bounced = false;
+            if (clone.WallBounces < MaxCloneWallBounces &&
+                (end.x <= -limit.x && clone.Velocity.x < 0f ||
+                 end.x >= limit.x && clone.Velocity.x > 0f))
+            {
+                end.x = Mathf.Clamp(end.x, -limit.x, limit.x);
+                clone.Velocity.x = -clone.Velocity.x;
+                clone.WallBounces++;
+                bounced = true;
+            }
+            if (clone.WallBounces < MaxCloneWallBounces &&
+                (end.y <= -limit.y && clone.Velocity.y < 0f ||
+                 end.y >= limit.y && clone.Velocity.y > 0f))
+            {
+                end.y = Mathf.Clamp(end.y, -limit.y, limit.y);
+                clone.Velocity.y = -clone.Velocity.y;
+                clone.WallBounces++;
+                bounced = true;
+            }
+            if (bounced) clone.HitEnemies.Clear();
+            clone.Rect.anchoredPosition = end;
+            Vector2 halfSize = Vector2.Scale(clone.Rect.rect.size * 0.5f,
+                clone.Rect.localScale);
+            for (int i = enemies.Count - 1; i >= 0; i--)
+            {
+                Enemy enemy = enemies[i];
+                if (clone.HitEnemies.Contains(enemy)) continue;
+                Vector2 enemyPosition = canvasRect.InverseTransformPoint(enemy.Rect.position);
+                if (!SweptCardTouchesEnemy(start, end, startAngle, endAngle,
+                    halfSize, enemyPosition, enemy.Radius)) continue;
+                clone.HitEnemies.Add(enemy);
+                bool killed = DamageEnemy(enemy,
+                    GetCardHitDamage(enemy, clone.AttackPower, clone.FastHit), clone.SourceSuit);
+                combo++;
+                score += 100 + Mathf.Min(combo, 20) * 10;
+                PlayHitSound();
+                ShowPopup(killed ? "명중!" : "타격", enemy.Rect.anchoredPosition, Color.black);
+                ShowCombo();
+                if (killed) DefeatEnemy(i);
+            }
+            Vector2 halfCanvas = canvasRect.rect.size * 0.5f;
+            Vector2 outerLimit = halfCanvas * 2f - limit;
+            if (Mathf.Abs(end.x) < outerLimit.x && Mathf.Abs(end.y) < outerLimit.y) continue;
+            Destroy(clone.Rect.gameObject);
+            cloneCards.RemoveAt(j);
+        }
+    }
+
+    private void ClearCloneCards()
+    {
+        for (int i = 0; i < cloneCards.Count; i++)
+            Destroy(cloneCards[i].Rect.gameObject);
+        cloneCards.Clear();
+    }
+
+    private bool DamageEnemy(Enemy enemy, int damage, Suit sourceSuit, bool miniCard = false)
+    {
+        if (enemy.Kind == EnemyKind.Boss) damage = Mathf.Min(damage, miniCard ? 7 : 6);
+        if (enemy.VulnerabilityStacks > 0 && Time.time < enemy.VulnerabilityExpiresAt)
+        {
+            float bonus = damage * (0.1f * enemy.VulnerabilityStacks) +
+                enemy.VulnerabilityBonusRemainder;
+            int extraDamage = Mathf.FloorToInt(bonus + 0.0001f);
+            damage += extraDamage;
+            enemy.VulnerabilityBonusRemainder = Mathf.Max(0f, bonus - extraDamage);
+        }
+        int dealtDamage = Mathf.Min(enemy.Health, Mathf.Max(0, damage));
         enemy.Health = Mathf.Max(0, enemy.Health - damage);
+        suitDamage[(int)sourceSuit] += dealtDamage;
+        UpdateDamageHud();
         float healthFraction = enemy.Health / (float)enemy.MaxHealth;
         enemy.HealthFill.sizeDelta = new Vector2(
             (enemy.Radius * 1.6f - 4f) * healthFraction, 4f);
@@ -792,7 +1048,20 @@ public sealed class CardDefenseGame : MonoBehaviour
         return enemy.Health == 0;
     }
 
-    private void DefeatEnemy(int index, bool mainCardKill)
+    private void ApplyCrealVulnerability(Enemy enemy)
+    {
+        if (Time.time >= enemy.VulnerabilityExpiresAt)
+        {
+            enemy.VulnerabilityStacks = 0;
+            enemy.VulnerabilityBonusRemainder = 0f;
+        }
+        enemy.VulnerabilityStacks = Mathf.Min(3, enemy.VulnerabilityStacks + 1);
+        enemy.VulnerabilityExpiresAt = Time.time + 5f;
+        enemy.VulnerabilityText.text = "약화 " + enemy.VulnerabilityStacks;
+        enemy.VulnerabilityText.gameObject.SetActive(true);
+    }
+
+    private void DefeatEnemy(int index)
     {
         Enemy enemy = enemies[index];
         Vector2 position = enemy.Rect.anchoredPosition;
@@ -808,23 +1077,40 @@ public sealed class CardDefenseGame : MonoBehaviour
         Destroy(enemy.Rect.gameObject);
         enemies.RemoveAt(index);
 
-        if (!mainCardKill || selectedSuit != Suit.Spade) return;
-        anaKillCount++;
-        if (anaKillCount < Mathf.Max(1, anaKillsPerBurst)) return;
-        anaKillCount = 0;
-        SpawnAnaMiniCards(cardThrow.Position);
-        PlayAbilitySound(anaAbilitySound);
-        ShowPopup("폭발!", cardThrow.Position, SuitColors[(int)Suit.Spade]);
+    }
+
+    private void RegisterCardHit()
+    {
+        if (selectedSuit == Suit.Heart &&
+            upgradeLevels[(int)Upgrade.Pharah] >= AbilityUnlockLevel)
+        {
+            paraHitCount++;
+            if (paraHitCount >= Mathf.Max(1, paraHitsPerBurst))
+            {
+                paraHitCount = 0;
+                paraBurstReady = true;
+            }
+        }
+        else if (selectedSuit == Suit.Spade)
+        {
+            anaHitCount++;
+            if (anaHitCount < Mathf.Max(1, anaHitsPerBurst)) return;
+            anaHitCount = 0;
+            SpawnAnaMiniCards(cardThrow.Position);
+            PlayAbilitySound(anaAbilitySound);
+            ShowPopup("폭발!", cardThrow.Position, SuitColors[(int)Suit.Spade]);
+        }
     }
 
     private void SpawnAnaMiniCards(Vector2 origin)
     {
-        int count = Mathf.Max(1, anaMiniCardCount);
+        int count = upgradeLevels[(int)Upgrade.Ana] >= AbilityUnlockLevel
+            ? 8 : Mathf.Max(1, anaMiniCardCount);
         for (int i = 0; i < count; i++)
         {
             float angle = (i + 0.5f) * Mathf.PI * 2f / count;
             Vector2 direction = new Vector2(Mathf.Cos(angle), Mathf.Sin(angle));
-            float sizeMultiplier = 1f + 0.1f * upgradeLevels[(int)Upgrade.Ana];
+            float sizeMultiplier = 1f + 0.1f * Mathf.Min(upgradeLevels[(int)Upgrade.Ana], AbilityUnlockLevel);
             RectTransform rect = CreateRect("Ana Mini Card", effectLayer,
                 new Vector2(30f, 42f) * sizeMultiplier, origin);
             Image image = rect.gameObject.AddComponent<Image>();
@@ -832,33 +1118,34 @@ public sealed class CardDefenseGame : MonoBehaviour
             image.preserveAspect = true;
             image.raycastTarget = false;
             rect.localRotation = Quaternion.Euler(0f, 0f, angle * Mathf.Rad2Deg - 90f);
-            miniCards.Add(new MiniCard { Rect = rect, Velocity = direction * anaMiniCardSpeed });
+            miniCards.Add(new MiniCard { Rect = rect, Velocity = direction * anaMiniCardSpeed,
+                SourceSuit = Suit.Spade });
         }
     }
 
     private void UpdateMiniCards()
     {
         float dt = Time.deltaTime;
+        int miniDamage = Mathf.Max(1 + upgradeLevels[(int)Upgrade.Ana],
+            GetParaBurstMaxDamage() + 1);
         for (int j = miniCards.Count - 1; j >= 0; j--)
         {
             MiniCard mini = miniCards[j];
             Vector2 start = mini.Rect.anchoredPosition;
             Vector2 end = start + mini.Velocity * dt;
             mini.Rect.anchoredPosition = end;
-            bool consumed = false;
             for (int i = enemies.Count - 1; i >= 0; i--)
             {
                 Enemy enemy = enemies[i];
+                if (mini.HitEnemies.Contains(enemy)) continue;
                 if (!SegmentTouchesCircle(start, end, enemy.Rect.anchoredPosition,
                     enemy.Radius + mini.Rect.rect.width * 0.5f)) continue;
+                mini.HitEnemies.Add(enemy);
                 score += 100;
-                if (DamageEnemy(enemy, 1 + upgradeLevels[(int)Upgrade.Ana])) DefeatEnemy(i, false);
+                if (DamageEnemy(enemy, miniDamage, mini.SourceSuit, true)) DefeatEnemy(i);
                 else ShowPopup("타격", enemy.Rect.anchoredPosition, Color.black);
-                consumed = true;
-                break;
             }
-            if (!consumed &&
-                Mathf.Abs(end.x) < canvasRect.rect.width * 0.5f + 30f &&
+            if (Mathf.Abs(end.x) < canvasRect.rect.width * 0.5f + 30f &&
                 Mathf.Abs(end.y) < canvasRect.rect.height * 0.5f + 30f) continue;
             Destroy(mini.Rect.gameObject);
             miniCards.RemoveAt(j);
@@ -881,13 +1168,13 @@ public sealed class CardDefenseGame : MonoBehaviour
         cardThrow.MultiplySpeed(GetCrealSpeedMultiplier());
         PlayAbilitySound(crealAbilitySound);
         if (serialStacks % 3 == 0)
-            ShowPopup("크리얼 " + serialStacks + "중첩", cardThrow.Position,
+            ShowPopup("씨리얼 " + serialStacks + "중첩", cardThrow.Position,
                 SuitColors[(int)Suit.Diamond]);
     }
 
     private float GetCrealSpeedMultiplier()
     {
-        return serialSpeedMultiplier + 0.015f * upgradeLevels[(int)Upgrade.Creal];
+        return serialSpeedMultiplier + 0.015f * Mathf.Min(upgradeLevels[(int)Upgrade.Creal], AbilityUnlockLevel);
     }
 
     private static bool SweptCardTouchesEnemy(Vector2 start, Vector2 end,
@@ -937,6 +1224,7 @@ public sealed class CardDefenseGame : MonoBehaviour
     private void EndGame()
     {
         gameOver = true;
+        ClearCloneCards();
         if (upgradeTab != null) upgradeTab.gameObject.SetActive(false);
         if (upgradePanel != null) upgradePanel.gameObject.SetActive(false);
         ClearGravityMotes();
@@ -990,6 +1278,53 @@ public sealed class CardDefenseGame : MonoBehaviour
         RefreshSkillTree();
     }
 
+#if UNITY_EDITOR
+    public bool DebugInvincible => debugInvincible;
+
+    public void ToggleDebugInvincibility()
+    {
+        if (!Application.isPlaying || gameOver) return;
+        debugInvincible = !debugInvincible;
+        ShowPopup(debugInvincible ? "무적 모드 켜짐" : "무적 모드 꺼짐",
+            Vector2.zero, debugInvincible ? Color.green : Color.gray);
+    }
+
+    public void GrantDebugCoins(int amount)
+    {
+        if (Application.isPlaying && !gameOver && amount > 0) AddCoins(amount);
+    }
+
+    public void SkipDebugWave()
+    {
+        if (!Application.isPlaying || gameOver || wave == 0) return;
+        ClearDebugWave();
+        BeginWave();
+        UpdateHud();
+    }
+
+    public void JumpToDebugWave(int targetWave)
+    {
+        if (!Application.isPlaying || gameOver || targetWave < 1) return;
+        ClearDebugWave();
+        wave = targetWave - 1;
+        BeginWave();
+        UpdateHud();
+    }
+
+    private void ClearDebugWave()
+    {
+        ClearCloneCards();
+        for (int i = 0; i < miniCards.Count; i++)
+            Destroy(miniCards[i].Rect.gameObject);
+        miniCards.Clear();
+        for (int i = 0; i < enemies.Count; i++)
+            Destroy(enemies[i].Rect.gameObject);
+        enemies.Clear();
+        paraBurstReady = false;
+        ClearGravityMotes();
+    }
+#endif
+
     private void CreateCoinHud()
     {
         RectTransform hud = statusText.rectTransform.parent as RectTransform;
@@ -1005,6 +1340,46 @@ public sealed class CardDefenseGame : MonoBehaviour
     private void UpdateCoinHud()
     {
         coinText.text = "코인  " + coins;
+    }
+
+    private void UpdateDamageHud()
+    {
+        long highest = 1;
+        for (int i = 0; i < suitDamage.Length; i++)
+            highest = System.Math.Max(highest, suitDamage[i]);
+        for (int i = 0; i < suitDamage.Length; i++)
+        {
+            suitDamageTexts[i].text = suitDamage[i].ToString("N0");
+            Image fill = suitDamageFills[i];
+            fill.enabled = suitDamage[i] > 0;
+            RectTransform track = fill.rectTransform.parent as RectTransform;
+            fill.rectTransform.sizeDelta = new Vector2(
+                Mathf.Max(track.rect.width, 1f) * (float)((double)suitDamage[i] / highest),
+                fill.rectTransform.sizeDelta.y);
+        }
+    }
+
+    private void UpdateDamageHudHover()
+    {
+        Mouse mouse = Mouse.current;
+        if (mouse == null) return;
+        Vector2 pointer = mouse.position.ReadValue();
+        bool show = RectTransformUtility.RectangleContainsScreenPoint(
+            damageHudPanel, pointer, uiCamera);
+        damageHudReveal = Mathf.MoveTowards(damageHudReveal, show ? 1f : 0f,
+            Time.unscaledDeltaTime * 1.8f);
+        for (int i = 0; i < damageHudContents.Length; i++)
+        {
+            float delay = i * 0.12f;
+            float progress = Mathf.Clamp01((damageHudReveal - delay) / 0.52f);
+            float fade = 1f - Mathf.Pow(1f - progress, 3f);
+            float distance = progress - 1f;
+            float slide = 1f + 2.2f * distance * distance * distance +
+                1.2f * distance * distance;
+            damageHudContents[i].anchoredPosition = damageHudShownPositions[i] +
+                Vector2.left * (55f * (1f - slide));
+            damageHudContentGroups[i].alpha = fade;
+        }
     }
 
     private void CreateSkillTree()
@@ -1119,37 +1494,82 @@ public sealed class CardDefenseGame : MonoBehaviour
 
     private int GetUpgradeCost(int index)
     {
-        return upgradeBaseCost + totalUpgrades * upgradeGlobalCostIncrease +
-            upgradeLevels[index] * upgradeLevelCostIncrease;
+        int level = upgradeLevels[index];
+        int cost = upgradeBaseCost + totalUpgrades * upgradeGlobalCostIncrease +
+            level * upgradeLevelCostIncrease;
+        if (IsAbilityUpgrade((Upgrade)index))
+        {
+            if (level == AbilityUnlockLevel - 1) cost *= 3;
+            if (level >= AbilityUnlockLevel)
+                cost = cost * 2 + (level - AbilityUnlockLevel) * 10;
+        }
+        return cost;
+    }
+
+    private static bool IsAbilityUpgrade(Upgrade upgrade)
+    {
+        return upgrade == Upgrade.Ana || upgrade == Upgrade.Creal ||
+            upgrade == Upgrade.Taffy || upgrade == Upgrade.Pharah;
+    }
+
+    private bool AreBasicUpgradesAtLevelTen()
+    {
+        return upgradeLevels[(int)Upgrade.Damage] >= AbilityUnlockLevel &&
+            upgradeLevels[(int)Upgrade.Speed] >= AbilityUnlockLevel &&
+            upgradeLevels[(int)Upgrade.Size] >= AbilityUnlockLevel;
     }
 
     private void BuyUpgrade(Upgrade upgrade)
     {
         if (gameOver) return;
         int index = (int)upgrade;
-        if (index < 0 || index >= (int)Upgrade.Count ||
-            upgradeLevels[index] >= MaxUpgradeLevel) return;
+        if (index < 0 || index >= (int)Upgrade.Count) return;
+        int maxLevel = IsAbilityUpgrade(upgrade) || AreBasicUpgradesAtLevelTen()
+            ? MaxAbilityLevel : AbilityUnlockLevel;
+        if (upgradeLevels[index] >= maxLevel) return;
         if (!TrySpendCoins(GetUpgradeCost(index))) return;
+        bool basicUpgradesUnlocked = AreBasicUpgradesAtLevelTen();
         upgradeLevels[index]++;
         totalUpgrades++;
-        if (upgrade == Upgrade.Speed || upgrade == Upgrade.Size || upgrade == Upgrade.Taffy)
+        if (upgrade == Upgrade.Speed || upgrade == Upgrade.Size)
         {
             float handY = -canvasRect.rect.height * 0.31f;
             cardThrow.Configure(1f + 0.08f * upgradeLevels[(int)Upgrade.Speed],
                 1f + 0.06f * upgradeLevels[(int)Upgrade.Size], handY);
-            cardThrow.SetOrbitUpgrades(0.25f * upgradeLevels[(int)Upgrade.Taffy],
-                0.04f * upgradeLevels[(int)Upgrade.Taffy]);
         }
-        if (upgrade == Upgrade.Taffy) visiblePassiveSuit = -1;
+        if (IsAbilityUpgrade(upgrade))
+            visiblePassiveSuit = -1;
         RefreshSkillTree();
+        if (!basicUpgradesUnlocked && AreBasicUpgradesAtLevelTen())
+            ShowPopup("일반 업그레이드 20레벨 개방!",
+                new Vector2(0f, canvasRect.rect.height * 0.18f), Color.white);
+        if (upgradeLevels[index] == AbilityUnlockLevel)
+        {
+            string unlockedName = upgrade == Upgrade.Ana ? "아나"
+                : upgrade == Upgrade.Pharah ? "파라"
+                : upgrade == Upgrade.Creal ? "씨리얼"
+                : upgrade == Upgrade.Taffy ? "테이피" : null;
+            if (unlockedName != null)
+            {
+                int suit = upgrade == Upgrade.Ana ? (int)Suit.Spade
+                    : upgrade == Upgrade.Pharah ? (int)Suit.Heart
+                    : upgrade == Upgrade.Creal ? (int)Suit.Diamond : (int)Suit.Club;
+                ShowPopup(unlockedName + " 능력 개방!",
+                    new Vector2(0f, canvasRect.rect.height * 0.18f), SuitColors[suit]);
+            }
+        }
     }
 
     private void RefreshSkillTree()
     {
         for (int i = 0; i < (int)Upgrade.Count; i++)
         {
-            bool maxed = upgradeLevels[i] >= MaxUpgradeLevel;
-            upgradeLabels[i].text = upgradeLevels[i] + "/" + MaxUpgradeLevel;
+            bool ability = IsAbilityUpgrade((Upgrade)i);
+            int maxLevel = ability || AreBasicUpgradesAtLevelTen()
+                ? MaxAbilityLevel : AbilityUnlockLevel;
+            bool maxed = upgradeLevels[i] >= maxLevel;
+            upgradeLabels[i].text = upgradeLevels[i] + "/" +
+                (ability && upgradeLevels[i] < AbilityUnlockLevel ? AbilityUnlockLevel : maxLevel);
             upgradePrices[i].text = maxed ? "최대" : GetUpgradeCost(i) + " 코인";
             upgradeButtons[i].interactable = !maxed && coins >= GetUpgradeCost(i);
         }
@@ -1158,7 +1578,7 @@ public sealed class CardDefenseGame : MonoBehaviour
     private void CreatePassiveDescription()
     {
         passiveDescriptionPanel = CreateRect("Card Passive Description", canvasRect,
-            new Vector2(0f, 104f), Vector2.zero);
+            new Vector2(0f, 128f), Vector2.zero);
         passiveDescriptionPanel.anchorMin = new Vector2(0.08f, 0f);
         passiveDescriptionPanel.anchorMax = new Vector2(0.92f, 0f);
         passiveDescriptionPanel.anchoredPosition = new Vector2(0f, 260f);
@@ -1178,24 +1598,30 @@ public sealed class CardDefenseGame : MonoBehaviour
             switch ((Suit)suit)
             {
                 case Suit.Heart:
-                    passiveDescriptionText.text =
-                        ParaDisplayName + "\n비행 중 카드 주변의 적을 끌어당깁니다. 한 번 끌린 적은 더 넓은 범위에서 끌립니다.";
+                    passiveDescriptionText.text = ParaDisplayName + "\n비행 중 주변 적을 끌어당김";
+                    if (upgradeLevels[(int)Upgrade.Pharah] >= AbilityUnlockLevel)
+                        passiveDescriptionText.text += "\n10레벨: 본 카드로 " + paraHitsPerBurst +
+                            "회 명중 시 폭발·밀치기\n11~20레벨: 폭발 피해 증가";
                     break;
                 case Suit.Club:
-                    passiveDescriptionText.text = TapieDisplayName + "\n카드를 잡는 범위가 " +
-                        taffyGrabRangeMultiplier.ToString("0.#") +
-                        "배 넓습니다. 비행 중 클릭하면 마우스 주변을 공전하고 " +
-                        "놓으면 더 빠르게 날아갑니다. 공전은 최대 " +
-                        cardThrow.MaxOrbitDuration.ToString("0.#") + "초입니다.";
+                    passiveDescriptionText.text = TapieDisplayName +
+                        "\n짝수 번째 벽 반사 시 절반 피해 복제 카드 1장 생성";
+                    if (upgradeLevels[(int)Upgrade.Taffy] >= AbilityUnlockLevel)
+                        passiveDescriptionText.text += "\n10레벨: 복제 카드 2장 생성\n11~20레벨: 복제 카드 피해 증가";
                     break;
                 case Suit.Spade:
-                    passiveDescriptionText.text = AnaDisplayName + "\n본 카드로 적 " + anaKillsPerBurst +
-                        "명 처치하면 작은 카드 " + anaMiniCardCount +
-                        "장을 방사형으로 발사합니다. 작은 카드는 화면 끝까지 날아갑니다.";
+                    passiveDescriptionText.text = AnaDisplayName + "\n본 카드로 " + anaHitsPerBurst +
+                        "회 명중 시 작은 카드 " +
+                        (upgradeLevels[(int)Upgrade.Ana] >= AbilityUnlockLevel ? 8 : anaMiniCardCount) +
+                        "장 발사·관통";
+                    if (upgradeLevels[(int)Upgrade.Ana] >= AbilityUnlockLevel)
+                        passiveDescriptionText.text += "\n11~20레벨: 작은 카드 피해 증가";
                     break;
                 case Suit.Diamond:
-                    passiveDescriptionText.text =
-                        CrealDisplayName + "\n적을 맞힐 때마다 속도가 중첩 증가합니다. 비행 제한시간이 없습니다.";
+                    passiveDescriptionText.text = CrealDisplayName +
+                        "\n적 명중: 속도 증가·약화(+10% 피해, 최대 3중첩/5초)";
+                    if (upgradeLevels[(int)Upgrade.Creal] >= AbilityUnlockLevel)
+                        passiveDescriptionText.text += "\n10레벨: 속도가 빠를수록 추가 피해\n11~20레벨: 속도 피해 강화";
                     break;
             }
             visiblePassiveSuit = suit;
@@ -1372,6 +1798,69 @@ public sealed class CardDefenseGame : MonoBehaviour
             yield return null;
         }
         for (int i = 0; i < count; i++) Destroy(pieces[i].gameObject);
+    }
+
+    private IEnumerator ShowParaShockwave(Vector2 origin, float radius, int maxDamage)
+    {
+        if (paraShockwaveSprite == null)
+        {
+            const int size = 128;
+            paraShockwaveTexture = new Texture2D(size, size, TextureFormat.RGBA32, false);
+            paraShockwaveTexture.wrapMode = TextureWrapMode.Clamp;
+            var pixels = new Color[size * size];
+            for (int y = 0; y < size; y++)
+            for (int x = 0; x < size; x++)
+            {
+                float distance = Vector2.Distance(new Vector2(x, y),
+                    new Vector2((size - 1) * 0.5f, (size - 1) * 0.5f)) / (size * 0.5f);
+                float alpha = Mathf.Clamp01((distance - 0.82f) * 25f) *
+                    Mathf.Clamp01((0.96f - distance) * 25f);
+                pixels[y * size + x] = new Color(1f, 1f, 1f, alpha);
+            }
+            paraShockwaveTexture.SetPixels(pixels);
+            paraShockwaveTexture.Apply();
+            paraShockwaveSprite = Sprite.Create(paraShockwaveTexture,
+                new Rect(0f, 0f, size, size), new Vector2(0.5f, 0.5f));
+        }
+
+        RectTransform ring = CreateRect("Para Shockwave", effectLayer, Vector2.one * 40f, origin);
+        Image image = ring.gameObject.AddComponent<Image>();
+        image.sprite = paraShockwaveSprite;
+        image.raycastTarget = false;
+        Color color = SuitColors[(int)Suit.Heart];
+        const float duration = 1.4f;
+        const float knockbackSpeed = 840f;
+        int burstWave = wave;
+        var hitEnemies = new HashSet<Enemy>();
+        float elapsed = 0f;
+        while (elapsed < duration && !gameOver && wave == burstWave)
+        {
+            elapsed += Time.deltaTime;
+            float progress = Mathf.Clamp01(elapsed / duration);
+            float waveRadius = Mathf.Lerp(20f, radius, progress);
+            ring.sizeDelta = Vector2.one * (waveRadius * 2f / 0.9f);
+            float fade = 1f - Mathf.SmoothStep(0.85f, 1f, progress);
+            image.color = new Color(color.r, color.g, color.b, 0.8f * fade);
+            for (int i = enemies.Count - 1; i >= 0; i--)
+            {
+                Enemy enemy = enemies[i];
+                if (hitEnemies.Contains(enemy)) continue;
+                Vector2 offset = enemy.Rect.anchoredPosition - origin;
+                if (offset.sqrMagnitude > waveRadius * waveRadius) continue;
+                hitEnemies.Add(enemy);
+                int damage = Mathf.Max(1, Mathf.CeilToInt(
+                    Mathf.Lerp(maxDamage, 1f, offset.magnitude / radius)));
+                if (DamageEnemy(enemy, damage, Suit.Heart))
+                {
+                    DefeatEnemy(i);
+                    continue;
+                }
+                Vector2 direction = offset.sqrMagnitude > 1f ? offset.normalized : Vector2.up;
+                enemy.KnockbackVelocity += direction * knockbackSpeed;
+            }
+            yield return null;
+        }
+        Destroy(ring.gameObject);
     }
 
     private void ShowPopup(string message, Vector2 position, Color color)

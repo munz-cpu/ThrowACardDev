@@ -2,7 +2,6 @@ using System;
 using UnityEngine;
 using UnityEngine.UI;
 using UnityEngine.EventSystems;
-using UnityEngine.InputSystem;
 
 public sealed class CanvasCardThrow : MonoBehaviour, IPointerDownHandler, IDragHandler, IPointerUpHandler
 {
@@ -19,6 +18,7 @@ public sealed class CanvasCardThrow : MonoBehaviour, IPointerDownHandler, IDragH
     [SerializeField, Min(0f)] private float friction = 0.12f;
     [SerializeField, Range(0f, 1f)] private float bounce = 0.85f;
     [SerializeField, Min(0f)] private float spinSpeed = 900f;
+    [SerializeField, Min(0f)] private float flyingGrabPadding = 45f;
 
     [Header("잡기 범위 표시")]
     [SerializeField] private Sprite grabRangeSprite;
@@ -30,13 +30,6 @@ public sealed class CanvasCardThrow : MonoBehaviour, IPointerDownHandler, IDragH
     [SerializeField, Min(0.01f)] private float trailSpawnInterval = 0.025f;
     [SerializeField, Min(0.01f)] private float trailLifetime = 0.22f;
     [SerializeField] private Color trailColor = new Color(0.3f, 0.85f, 1f, 0.42f);
-
-    [Header("공전 패시브")]
-    [SerializeField, Min(0f)] private float orbitCenterFollowSpeed = 10f;
-    [SerializeField, Min(0f)] private float orbitSpeedGainPerSecond = 0.12f;
-    [SerializeField, Min(0f)] private float orbitRadiusRestoreSpeed = 220f;
-    [SerializeField, Min(0.1f)] private float maxOrbitDuration = 2.5f;
-    [SerializeField, Min(1f)] private float orbitReleaseSpeedMultiplier = 1.1f;
 
     private sealed class TrailGhost
     {
@@ -50,6 +43,7 @@ public sealed class CanvasCardThrow : MonoBehaviour, IPointerDownHandler, IDragH
     private const float GrabRangeStartScale = 0.08f;
     private readonly TrailGhost[] trailGhosts = new TrailGhost[TrailPoolSize];
     private RectTransform grabRangeRect;
+    private RectTransform flyingGrabRect;
     private Image grabRangeImage;
     private float grabRangeGrowElapsed;
     private float trailTimer;
@@ -59,21 +53,19 @@ public sealed class CanvasCardThrow : MonoBehaviour, IPointerDownHandler, IDragH
     public event Action Released;
     public event Action Thrown;
     public event Action WallBounced;
-    public event Action OrbitStarted;
     public RectTransform CardRect => cardRect;
     public Image CardImage => cardRect.GetComponent<Image>();
     public Vector2 Position => cardRect.anchoredPosition;
+    public Vector2 Velocity => velocity;
     public float Speed => velocity.magnitude;
     public float TrailMinSpeed => trailMinSpeed;
     public bool IsDragging => dragging;
     public bool IsFlying { get; private set; }
-    public bool IsOrbiting => orbiting;
-    public float MaxOrbitDuration => maxOrbitDuration + orbitDurationBonus;
 
     private Vector2 handPosition;
     private Vector2 baseSize;
     private float speedMultiplier = 1f;
-    private float grabDistanceMultiplier = 1f;
+    private float flightSizeMultiplier = 1f;
 
     private Vector2 velocity;
     private Vector2 pointerOffset;
@@ -83,19 +75,6 @@ public sealed class CanvasCardThrow : MonoBehaviour, IPointerDownHandler, IDragH
     private float rotationSpeed;
     private bool dragging;
     private float lift;
-    private bool orbitEnabled;
-    private bool orbiting;
-    private Vector2 orbitCenter;
-    private float orbitRadius;
-    private float orbitBaseRadius;
-    private float orbitRestoreAt;
-    private float orbitAngle;
-    private float orbitDirection;
-    private float orbitStartSpeed;
-    private float orbitDuration;
-    private float orbitDurationBonus;
-    private float orbitReleaseSpeedBonus;
-    private Camera canvasCamera;
 
     private void Awake()
     {
@@ -108,11 +87,9 @@ public sealed class CanvasCardThrow : MonoBehaviour, IPointerDownHandler, IDragH
         {
             handPosition = cardRect.anchoredPosition;
             baseSize = cardRect.sizeDelta;
-            Canvas canvas = canvasRect.GetComponent<Canvas>();
-            canvasCamera = canvas != null && canvas.renderMode != RenderMode.ScreenSpaceOverlay
-                ? canvas.worldCamera : null;
             CreateTrailPool();
             CreateGrabRange();
+            CreateFlyingGrabArea();
             UpdateAppearance();
         }
     }
@@ -120,8 +97,8 @@ public sealed class CanvasCardThrow : MonoBehaviour, IPointerDownHandler, IDragH
     private void OnDisable()
     {
         dragging = false;
-        orbiting = false;
         if (grabRangeRect != null) grabRangeRect.gameObject.SetActive(false);
+        if (flyingGrabRect != null) flyingGrabRect.gameObject.SetActive(false);
         ClearTrail();
     }
 
@@ -137,16 +114,15 @@ public sealed class CanvasCardThrow : MonoBehaviour, IPointerDownHandler, IDragH
         else
         {
             float dt = Time.deltaTime;
-            UpdateOrbit(dt);
-            if (!orbiting)
-            {
-                cardRect.anchoredPosition += velocity * dt;
-                cardRect.Rotate(0f, 0f, rotationSpeed * dt);
-                float damping = Mathf.Exp(-friction * dt);
-                velocity *= damping;
-                rotationSpeed *= damping;
-                BounceInsideCanvas();
-            }
+            float maxRotationSpeed = spinSpeed *
+                Mathf.Clamp01(velocity.magnitude / Mathf.Max(1f, trailMinSpeed));
+            rotationSpeed = Mathf.Clamp(rotationSpeed, -maxRotationSpeed, maxRotationSpeed);
+            cardRect.anchoredPosition += velocity * dt;
+            cardRect.Rotate(0f, 0f, rotationSpeed * dt);
+            float damping = Mathf.Exp(-friction * dt);
+            velocity *= damping;
+            rotationSpeed *= damping;
+            BounceInsideCanvas();
         }
 
         lift = Mathf.MoveTowards(lift, dragging ? 1f : 0f, Time.unscaledDeltaTime * 8f);
@@ -157,12 +133,12 @@ public sealed class CanvasCardThrow : MonoBehaviour, IPointerDownHandler, IDragH
     public void OnPointerDown(PointerEventData eventData)
     {
         if (eventData.button != PointerEventData.InputButton.Left ||
-            eventData.pointerCurrentRaycast.gameObject != cardRect.gameObject ||
+            (eventData.pointerCurrentRaycast.gameObject != cardRect.gameObject &&
+             eventData.pointerCurrentRaycast.gameObject != flyingGrabRect.gameObject) ||
             !TryGetPointer(eventData, out Vector2 pointer)) return;
 
         dragging = true;
-        orbiting = false;
-        orbitDuration = 0f;
+        flyingGrabRect.gameObject.SetActive(false);
         velocity = Vector2.zero;
         rotationSpeed = 0f;
         dragVelocity = Vector2.zero;
@@ -180,7 +156,7 @@ public sealed class CanvasCardThrow : MonoBehaviour, IPointerDownHandler, IDragH
 
         Vector2 previousPosition = cardRect.anchoredPosition;
         Vector2 offset = Vector2.ClampMagnitude(pointer + pointerOffset - grabStartPosition,
-            maxGrabDistance * grabDistanceMultiplier);
+            maxGrabDistance);
         Vector2 limit = GetCanvasLimit();
         Vector2 target = grabStartPosition + offset;
         cardRect.anchoredPosition = new Vector2(
@@ -200,7 +176,6 @@ public sealed class CanvasCardThrow : MonoBehaviour, IPointerDownHandler, IDragH
     {
         if (!dragging || eventData.button != PointerEventData.InputButton.Left) return;
         dragging = false;
-        orbiting = false;
         grabRangeRect.gameObject.SetActive(false);
         if (Time.unscaledTime - lastDragTime > 0.1f) dragVelocity = Vector2.zero;
         velocity = Vector2.ClampMagnitude(dragVelocity * throwMultiplier * speedMultiplier, maxSpeed);
@@ -209,7 +184,7 @@ public sealed class CanvasCardThrow : MonoBehaviour, IPointerDownHandler, IDragH
         if (velocity.sqrMagnitude > 100f)
         {
             IsFlying = true;
-            orbitDuration = 0f;
+            flyingGrabRect.gameObject.SetActive(true);
             Thrown?.Invoke();
         }
         else IsFlying = false;
@@ -220,36 +195,26 @@ public sealed class CanvasCardThrow : MonoBehaviour, IPointerDownHandler, IDragH
     {
         speedMultiplier = newSpeedMultiplier;
         cardRect.sizeDelta = baseSize * sizeMultiplier;
+        flyingGrabRect.sizeDelta = cardRect.sizeDelta + Vector2.one * flyingGrabPadding * 2f;
         shadowRect.sizeDelta = cardRect.sizeDelta;
         handPosition = new Vector2(0f, handY);
         if (!IsFlying && !dragging) cardRect.anchoredPosition = handPosition;
         UpdateAppearance();
     }
 
-    public void SetOrbitEnabled(bool enabled)
+    public void SetFlightSizeMultiplier(float multiplier)
     {
-        orbitEnabled = enabled;
-        if (!enabled) orbiting = false;
-    }
-
-    public void SetOrbitUpgrades(float durationBonus, float releaseSpeedBonus)
-    {
-        orbitDurationBonus = Mathf.Max(0f, durationBonus);
-        orbitReleaseSpeedBonus = Mathf.Max(0f, releaseSpeedBonus);
-    }
-
-    public void SetGrabDistanceMultiplier(float multiplier)
-    {
-        grabDistanceMultiplier = Mathf.Max(1f, multiplier);
+        flightSizeMultiplier = Mathf.Max(1f, multiplier);
+        UpdateAppearance();
     }
 
     public void ReturnToHand(Sprite sprite, Color tint)
     {
         dragging = false;
-        orbiting = false;
-        orbitDuration = 0f;
         grabRangeRect.gameObject.SetActive(false);
         IsFlying = false;
+        flightSizeMultiplier = 1f;
+        flyingGrabRect.gameObject.SetActive(false);
         velocity = Vector2.zero;
         rotationSpeed = 0f;
         dragVelocity = Vector2.zero;
@@ -276,102 +241,13 @@ public sealed class CanvasCardThrow : MonoBehaviour, IPointerDownHandler, IDragH
         return true;
     }
 
-    private void UpdateOrbit(float dt)
-    {
-        Mouse mouse = Mouse.current;
-        bool holding = orbitEnabled && IsFlying && orbitDuration < MaxOrbitDuration &&
-            mouse != null && mouse.leftButton.isPressed;
-        if (!holding)
-        {
-            if (orbiting)
-            {
-                ReleaseOrbit();
-            }
-            return;
-        }
-
-        if (!RectTransformUtility.ScreenPointToLocalPointInRectangle(
-            canvasRect, mouse.position.ReadValue(), canvasCamera, out Vector2 pointer)) return;
-        pointer -= canvasRect.rect.center;
-
-        if (!orbiting)
-        {
-            orbiting = true;
-            orbitCenter = pointer;
-            Vector2 radial = cardRect.anchoredPosition - orbitCenter;
-            orbitRadius = Mathf.Max(40f, radial.magnitude);
-            orbitBaseRadius = orbitRadius;
-            orbitRestoreAt = 0f;
-            orbitAngle = Mathf.Atan2(radial.y, radial.x);
-            orbitDirection = radial.x * velocity.y - radial.y * velocity.x >= 0f ? 1f : -1f;
-            orbitStartSpeed = Mathf.Max(velocity.magnitude, 150f);
-            OrbitStarted?.Invoke();
-        }
-
-        orbitDuration = Mathf.Min(MaxOrbitDuration, orbitDuration + dt);
-        orbitCenter = Vector2.Lerp(orbitCenter, pointer,
-            1f - Mathf.Exp(-orbitCenterFollowSpeed * dt));
-        Vector2 limit = GetCanvasLimit();
-        Vector2 centerLimit = Vector2.Max(Vector2.zero, limit - Vector2.one * 24f);
-        orbitCenter = new Vector2(
-            Mathf.Clamp(orbitCenter.x, -centerLimit.x, centerLimit.x),
-            Mathf.Clamp(orbitCenter.y, -centerLimit.y, centerLimit.y));
-        float orbitSpeed = Mathf.Min(maxSpeed,
-            orbitStartSpeed * (1f + orbitDuration * orbitSpeedGainPerSecond));
-        orbitAngle += orbitDirection * Mathf.Min(8f, orbitSpeed / Mathf.Max(40f, orbitRadius)) * dt;
-        Vector2 radialDirection = new Vector2(Mathf.Cos(orbitAngle), Mathf.Sin(orbitAngle));
-        float allowedRadius = GetAllowedOrbitRadius(orbitCenter, radialDirection, limit);
-        if (orbitRadius > allowedRadius)
-        {
-            orbitRadius = allowedRadius;
-            orbitRestoreAt = Time.time + 0.3f;
-        }
-        else if (Time.time >= orbitRestoreAt)
-        {
-            orbitRadius = Mathf.Min(orbitBaseRadius,
-                Mathf.Min(allowedRadius, orbitRadius + orbitRadiusRestoreSpeed * dt));
-        }
-        cardRect.anchoredPosition = orbitCenter + radialDirection * orbitRadius;
-        cardRect.anchoredPosition = new Vector2(
-            Mathf.Clamp(cardRect.anchoredPosition.x, -limit.x, limit.x),
-            Mathf.Clamp(cardRect.anchoredPosition.y, -limit.y, limit.y));
-        velocity = new Vector2(-radialDirection.y, radialDirection.x) *
-            (orbitDirection * orbitSpeed);
-        cardRect.Rotate(0f, 0f, rotationSpeed * dt);
-        if (orbitDuration >= MaxOrbitDuration)
-        {
-            ReleaseOrbit();
-        }
-    }
-
-    private void ReleaseOrbit()
-    {
-        orbiting = false;
-        velocity = Vector2.ClampMagnitude(velocity *
-            (orbitReleaseSpeedMultiplier + orbitReleaseSpeedBonus), maxSpeed);
-        rotationSpeed = spinSpeed * (velocity.x >= 0f ? -1f : 1f);
-    }
-
-    private static float GetAllowedOrbitRadius(Vector2 center, Vector2 direction, Vector2 limit)
-    {
-        float xDistance = direction.x > 0.001f
-            ? (limit.x - center.x) / direction.x
-            : direction.x < -0.001f ? (-limit.x - center.x) / direction.x
-            : float.PositiveInfinity;
-        float yDistance = direction.y > 0.001f
-            ? (limit.y - center.y) / direction.y
-            : direction.y < -0.001f ? (-limit.y - center.y) / direction.y
-            : float.PositiveInfinity;
-        return Mathf.Max(0f, Mathf.Min(xDistance, yDistance) - 8f);
-    }
-
     private void CreateGrabRange()
     {
         var rangeObject = new GameObject("Grab Range", typeof(RectTransform), typeof(Image));
         grabRangeRect = rangeObject.GetComponent<RectTransform>();
         grabRangeRect.SetParent(canvasRect, false);
         grabRangeRect.anchorMin = grabRangeRect.anchorMax = new Vector2(0.5f, 0.5f);
-        grabRangeRect.sizeDelta = Vector2.one * (maxGrabDistance * grabDistanceMultiplier * 2f);
+        grabRangeRect.sizeDelta = Vector2.one * (maxGrabDistance * 2f);
         grabRangeRect.SetSiblingIndex(cardRect.GetSiblingIndex());
         grabRangeImage = rangeObject.GetComponent<Image>();
         grabRangeImage.sprite = grabRangeSprite;
@@ -380,11 +256,24 @@ public sealed class CanvasCardThrow : MonoBehaviour, IPointerDownHandler, IDragH
         rangeObject.SetActive(false);
     }
 
+    private void CreateFlyingGrabArea()
+    {
+        var areaObject = new GameObject("Flying Grab Area", typeof(RectTransform), typeof(Image));
+        flyingGrabRect = areaObject.GetComponent<RectTransform>();
+        flyingGrabRect.SetParent(cardRect, false);
+        flyingGrabRect.anchorMin = flyingGrabRect.anchorMax = new Vector2(0.5f, 0.5f);
+        flyingGrabRect.sizeDelta = cardRect.sizeDelta + Vector2.one * flyingGrabPadding * 2f;
+        Image image = areaObject.GetComponent<Image>();
+        image.color = Color.clear;
+        image.raycastTarget = true;
+        areaObject.SetActive(false);
+    }
+
     private void ShowGrabRange()
     {
         if (grabRangeSprite == null) return;
         grabRangeRect.anchoredPosition = grabStartPosition;
-        grabRangeRect.sizeDelta = Vector2.one * (maxGrabDistance * grabDistanceMultiplier * 2f);
+        grabRangeRect.sizeDelta = Vector2.one * (maxGrabDistance * 2f);
         grabRangeGrowElapsed = 0f;
         grabRangeRect.localScale = Vector3.one * GrabRangeStartScale;
         grabRangeRect.localRotation = Quaternion.identity;
@@ -435,17 +324,17 @@ public sealed class CanvasCardThrow : MonoBehaviour, IPointerDownHandler, IDragH
         float angle = cardRect.localEulerAngles.z * Mathf.Deg2Rad;
         float c = Mathf.Abs(Mathf.Cos(angle));
         float s = Mathf.Abs(Mathf.Sin(angle));
-        Vector2 half = cardRect.rect.size * 0.5f;
+        Vector2 half = cardRect.rect.size * (cardRect.localScale.x * 0.5f);
         Vector2 extent = new Vector2(c * half.x + s * half.y, s * half.x + c * half.y);
         return Vector2.Max(Vector2.zero, canvasRect.rect.size * 0.5f - extent);
     }
 
     private void UpdateAppearance()
     {
-        cardRect.localScale = Vector3.one * (1f + lift * 0.07f);
+        cardRect.localScale = Vector3.one * ((1f + lift * 0.07f) * flightSizeMultiplier);
         shadowRect.anchoredPosition = cardRect.anchoredPosition + new Vector2(8f + lift * 14f, -10f - lift * 17f);
         shadowRect.localRotation = cardRect.localRotation;
-        shadowRect.localScale = Vector3.one * (1f + lift * 0.035f);
+        shadowRect.localScale = Vector3.one * ((1f + lift * 0.035f) * flightSizeMultiplier);
         shadowImage.color = new Color(0f, 0f, 0f, 0.12f + lift * 0.16f);
     }
 
