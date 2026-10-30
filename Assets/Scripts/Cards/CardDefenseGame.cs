@@ -9,6 +9,7 @@ using UnityEngine.InputSystem;
 public sealed class CardDefenseGame : MonoBehaviour
 {
     private enum Suit { Heart, Club, Spade, Diamond }
+    private enum VisualTheme { School, Classic }
     private enum EnemyKind { Basic, Runner, Tank, Boss }
     private enum Upgrade { Damage, Speed, Size, Ana, Creal, Taffy, Pharah, Count }
     private const string AnaDisplayName = "ANA";
@@ -85,6 +86,9 @@ public sealed class CardDefenseGame : MonoBehaviour
     [SerializeField] private Button[] suitButtons = new Button[4];
     [SerializeField] private Sprite[] suitSprites = new Sprite[4];
     [SerializeField] private Sprite[] rankSprites = new Sprite[48];
+    [Header("카드 테마")]
+    [SerializeField] private VisualTheme visualTheme = VisualTheme.Classic;
+    [SerializeField] private Sprite[] classicRankSprites = new Sprite[52];
     [SerializeField] private Suit selectedSuit = Suit.Spade;
 
     [Header("적 이미지")]
@@ -250,6 +254,7 @@ public sealed class CardDefenseGame : MonoBehaviour
     private Vector2Int lastScreenSize;
     private Vector2 lastCanvasSize;
     private Sprite selectedCardSprite;
+    private bool IsClassicTheme => visualTheme == VisualTheme.Classic;
     private Vector2 previousCardPosition;
     private float previousCardAngle;
 
@@ -261,7 +266,8 @@ public sealed class CardDefenseGame : MonoBehaviour
             gameOverPanel == null ||
             restartButton == null || suitSelector == null || suitButtons == null || suitButtons.Length != 4 ||
             suitSprites == null || suitSprites.Length != 4 ||
-            rankSprites == null || rankSprites.Length != 48)
+            rankSprites == null || rankSprites.Length != 48 ||
+            IsClassicTheme && (classicRankSprites == null || classicRankSprites.Length != 52))
         {
             Debug.LogError("CardDefenseGame의 씬 UI 참조를 연결하세요.", this);
             enabled = false;
@@ -280,6 +286,7 @@ public sealed class CardDefenseGame : MonoBehaviour
             return;
         }
         audioSource.playOnAwake = false;
+        AddCardOutline(cardThrow.CardImage);
         abilityAudioSource = gameObject.AddComponent<AudioSource>();
         abilityAudioSource.playOnAwake = false;
         abilityAudioSource.spatialBlend = 0f;
@@ -289,7 +296,8 @@ public sealed class CardDefenseGame : MonoBehaviour
         for (int i = 0; i < suitButtons.Length; i++)
         {
             int suit = i;
-            if (suitButtons[i] == null || suitSprites[i] == null)
+            Sprite suitSprite = GetSuitSprite((Suit)i);
+            if (suitButtons[i] == null || suitSprite == null)
             {
                 Debug.LogError("카드 4종과 해당 이미지를 모두 연결하세요.", this);
                 enabled = false;
@@ -297,17 +305,27 @@ public sealed class CardDefenseGame : MonoBehaviour
             }
             suitCardRects[i] = suitButtons[i].GetComponent<RectTransform>();
             suitCardImages[i] = suitButtons[i].GetComponent<Image>();
-            suitCardImages[i].sprite = suitSprites[i];
+            suitCardImages[i].sprite = suitSprite;
             suitCardImages[i].preserveAspect = true;
             suitCardImages[i].raycastTarget = false;
+            AddCardOutline(suitCardImages[i]);
             suitButtons[i].onClick.AddListener(() => SelectSuit(suit));
         }
-        for (int i = 0; i < rankSprites.Length; i++)
+        Sprite[] activeRankSprites = IsClassicTheme ? classicRankSprites : rankSprites;
+        for (int i = 0; i < activeRankSprites.Length; i++)
         {
-            if (rankSprites[i] != null) continue;
-            Debug.LogError("카드 이미지 48장을 모두 연결하세요.", this);
+            if (activeRankSprites[i] != null) continue;
+            Debug.LogError("현재 테마의 카드 이미지를 모두 연결하세요.", this);
             enabled = false;
             return;
+        }
+        if (IsClassicTheme)
+        {
+            for (int i = 0; i < suitDamageTexts.Length; i++)
+            {
+                Text name = suitDamageTexts[i].transform.parent.Find("Name").GetComponent<Text>();
+                name.text = GetSuitDisplayName((Suit)i);
+            }
         }
         restartButton.onClick.AddListener(() => SceneManager.LoadScene(SceneManager.GetActiveScene().buildIndex));
         CreateFinalScoreText();
@@ -316,6 +334,16 @@ public sealed class CardDefenseGame : MonoBehaviour
         cardThrow.Released += OnReleased;
         cardThrow.Thrown += OnThrown;
         cardThrow.WallBounced += OnWallBounced;
+        if (IsClassicTheme)
+        {
+            coreImage.sprite = uiSprite;
+            coreImage.type = Image.Type.Sliced;
+            coreImage.pixelsPerUnitMultiplier = 0.6f;
+            coreImage.preserveAspect = false;
+            coreImage.color = new Color(0.18f, 0.34f, 0.58f);
+            coreText.text = "코어";
+            coreText.color = Color.white;
+        }
         coreBaseColor = coreImage.color;
         coreHealth = startingCoreHealth;
         coins = 0;
@@ -457,7 +485,32 @@ public sealed class CardDefenseGame : MonoBehaviour
 
     private void PickRandomCard()
     {
-        selectedCardSprite = rankSprites[(int)selectedSuit * 12 + Random.Range(0, 12)];
+        int count = IsClassicTheme ? 13 : 12;
+        Sprite[] sprites = IsClassicTheme ? classicRankSprites : rankSprites;
+        int row = IsClassicTheme ? GetClassicSuitRow(selectedSuit) : (int)selectedSuit;
+        selectedCardSprite = sprites[row * count + Random.Range(0, count)];
+    }
+
+    private static int GetClassicSuitRow(Suit suit)
+    {
+        // The classic sheet is ordered Club, Heart, Spade, Diamond.
+        return suit == Suit.Club ? 0 : suit == Suit.Heart ? 1
+            : suit == Suit.Spade ? 2 : 3;
+    }
+
+    private Sprite GetSuitSprite(Suit suit)
+    {
+        return IsClassicTheme ? classicRankSprites[GetClassicSuitRow(suit) * 13]
+            : suitSprites[(int)suit];
+    }
+
+    private string GetSuitDisplayName(Suit suit)
+    {
+        if (IsClassicTheme)
+            return suit == Suit.Heart ? "하트" : suit == Suit.Club ? "클럽"
+                : suit == Suit.Spade ? "스페이드" : "다이아";
+        return suit == Suit.Heart ? ParaDisplayName : suit == Suit.Club ? TapieDisplayName
+            : suit == Suit.Spade ? AnaDisplayName : CrealDisplayName;
     }
 
     private void UpdateSuitCards()
@@ -594,6 +647,7 @@ public sealed class CardDefenseGame : MonoBehaviour
             image.color = new Color(cardColor.r, cardColor.g, cardColor.b, cardColor.a * 0.5f);
             image.preserveAspect = true;
             image.raycastTarget = false;
+            AddCardOutline(image);
             cloneCards.Add(new CloneCard
             {
                 Rect = rect,
@@ -700,17 +754,29 @@ public sealed class CardDefenseGame : MonoBehaviour
             : side == 2 ? new Vector2(UnityEngine.Random.Range(-halfW, halfW), -halfH)
             : new Vector2(UnityEngine.Random.Range(-halfW, halfW), halfH);
         Image image = rect.gameObject.AddComponent<Image>();
-        Sprite enemySprite = kind == EnemyKind.Boss || kind == EnemyKind.Tank ? tankEnemySprite
+        Sprite enemySprite = IsClassicTheme ? uiSprite
+            : kind == EnemyKind.Boss || kind == EnemyKind.Tank ? tankEnemySprite
             : kind == EnemyKind.Runner ? runnerEnemySprite : basicEnemySprite;
         image.sprite = enemySprite;
-        image.color = kind == EnemyKind.Boss || enemySprite == null ? color : Color.white;
-        image.preserveAspect = enemySprite != null;
+        image.color = IsClassicTheme || kind == EnemyKind.Boss || enemySprite == null
+            ? color : Color.white;
+        image.preserveAspect = !IsClassicTheme && enemySprite != null;
         image.raycastTarget = false;
-        if (enemySprite == null)
+        if (IsClassicTheme)
         {
-            Text glyph = MakeText(kind == EnemyKind.Boss ? "BOSS" : kind == EnemyKind.Tank ? "강"
-                : kind == EnemyKind.Runner ? ">" : "X",
+            image.type = Image.Type.Sliced;
+            image.pixelsPerUnitMultiplier = 0.75f;
+        }
+        if (IsClassicTheme || enemySprite == null)
+        {
+            string glyphText = IsClassicTheme
+                ? kind == EnemyKind.Boss ? "보스" : kind == EnemyKind.Tank ? "방"
+                    : kind == EnemyKind.Runner ? "속" : "적"
+                : kind == EnemyKind.Boss ? "BOSS" : kind == EnemyKind.Tank ? "강"
+                    : kind == EnemyKind.Runner ? ">" : "X";
+            Text glyph = MakeText(glyphText,
                 rect, 24, Color.white, TextAnchor.MiddleCenter);
+            glyph.fontStyle = FontStyle.Bold;
             Stretch(glyph.rectTransform, 0f);
         }
         int maxHealth = kind == EnemyKind.Boss
@@ -830,7 +896,8 @@ public sealed class CardDefenseGame : MonoBehaviour
         int maxDamage = GetParaBurstMaxDamage();
         PlayAbilitySound(paraBurstSound != null ? paraBurstSound : anaAbilitySound, true);
         Shake(18f, 0.2f);
-        ShowPopup("파라 폭발!", origin, SuitColors[(int)Suit.Heart]);
+        ShowPopup(GetSuitDisplayName(Suit.Heart) + " 폭발!", origin,
+            SuitColors[(int)Suit.Heart]);
         StartCoroutine(ShowParaShockwave(origin, radius, maxDamage));
     }
 
@@ -1102,6 +1169,15 @@ public sealed class CardDefenseGame : MonoBehaviour
         }
     }
 
+    private static void AddCardOutline(Image image)
+    {
+        Outline outline = image.GetComponent<Outline>();
+        if (outline == null) outline = image.gameObject.AddComponent<Outline>();
+        outline.effectColor = new Color(0.08f, 0.09f, 0.12f, 0.9f);
+        outline.effectDistance = new Vector2(2.5f, -2.5f);
+        outline.useGraphicAlpha = true;
+    }
+
     private void SpawnAnaMiniCards(Vector2 origin)
     {
         int count = upgradeLevels[(int)Upgrade.Ana] >= AbilityUnlockLevel
@@ -1117,6 +1193,7 @@ public sealed class CardDefenseGame : MonoBehaviour
             image.sprite = selectedCardSprite;
             image.preserveAspect = true;
             image.raycastTarget = false;
+            AddCardOutline(image);
             rect.localRotation = Quaternion.Euler(0f, 0f, angle * Mathf.Rad2Deg - 90f);
             miniCards.Add(new MiniCard { Rect = rect, Velocity = direction * anaMiniCardSpeed,
                 SourceSuit = Suit.Spade });
@@ -1168,7 +1245,7 @@ public sealed class CardDefenseGame : MonoBehaviour
         cardThrow.MultiplySpeed(GetCrealSpeedMultiplier());
         PlayAbilitySound(crealAbilitySound);
         if (serialStacks % 3 == 0)
-            ShowPopup("씨리얼 " + serialStacks + "중첩", cardThrow.Position,
+            ShowPopup(GetSuitDisplayName(Suit.Diamond) + " " + serialStacks + "중첩", cardThrow.Position,
                 SuitColors[(int)Suit.Diamond]);
     }
 
@@ -1407,8 +1484,9 @@ public sealed class CardDefenseGame : MonoBehaviour
         upgradePanel = panel;
         string[] names =
         {
-            "카드 피해량", "카드 속도", "카드 크기", AnaDisplayName, CrealDisplayName,
-            TapieDisplayName, ParaDisplayName
+            "카드 피해량", "카드 속도", "카드 크기", GetSuitDisplayName(Suit.Spade),
+            GetSuitDisplayName(Suit.Diamond), GetSuitDisplayName(Suit.Club),
+            GetSuitDisplayName(Suit.Heart)
         };
         Color[] colors =
         {
@@ -1545,10 +1623,10 @@ public sealed class CardDefenseGame : MonoBehaviour
                 new Vector2(0f, canvasRect.rect.height * 0.18f), Color.white);
         if (upgradeLevels[index] == AbilityUnlockLevel)
         {
-            string unlockedName = upgrade == Upgrade.Ana ? "아나"
-                : upgrade == Upgrade.Pharah ? "파라"
-                : upgrade == Upgrade.Creal ? "씨리얼"
-                : upgrade == Upgrade.Taffy ? "테이피" : null;
+            string unlockedName = upgrade == Upgrade.Ana ? GetSuitDisplayName(Suit.Spade)
+                : upgrade == Upgrade.Pharah ? GetSuitDisplayName(Suit.Heart)
+                : upgrade == Upgrade.Creal ? GetSuitDisplayName(Suit.Diamond)
+                : upgrade == Upgrade.Taffy ? GetSuitDisplayName(Suit.Club) : null;
             if (unlockedName != null)
             {
                 int suit = upgrade == Upgrade.Ana ? (int)Suit.Spade
@@ -1598,19 +1676,21 @@ public sealed class CardDefenseGame : MonoBehaviour
             switch ((Suit)suit)
             {
                 case Suit.Heart:
-                    passiveDescriptionText.text = ParaDisplayName + "\n비행 중 주변 적을 끌어당김";
+                    passiveDescriptionText.text = GetSuitDisplayName(Suit.Heart) +
+                        "\n비행 중 주변 적을 끌어당김";
                     if (upgradeLevels[(int)Upgrade.Pharah] >= AbilityUnlockLevel)
                         passiveDescriptionText.text += "\n10레벨: 본 카드로 " + paraHitsPerBurst +
                             "회 명중 시 폭발·밀치기\n11~20레벨: 폭발 피해 증가";
                     break;
                 case Suit.Club:
-                    passiveDescriptionText.text = TapieDisplayName +
+                    passiveDescriptionText.text = GetSuitDisplayName(Suit.Club) +
                         "\n짝수 번째 벽 반사 시 절반 피해 복제 카드 1장 생성";
                     if (upgradeLevels[(int)Upgrade.Taffy] >= AbilityUnlockLevel)
                         passiveDescriptionText.text += "\n10레벨: 복제 카드 2장 생성\n11~20레벨: 복제 카드 피해 증가";
                     break;
                 case Suit.Spade:
-                    passiveDescriptionText.text = AnaDisplayName + "\n본 카드로 " + anaHitsPerBurst +
+                    passiveDescriptionText.text = GetSuitDisplayName(Suit.Spade) +
+                        "\n본 카드로 " + anaHitsPerBurst +
                         "회 명중 시 작은 카드 " +
                         (upgradeLevels[(int)Upgrade.Ana] >= AbilityUnlockLevel ? 8 : anaMiniCardCount) +
                         "장 발사·관통";
@@ -1618,7 +1698,7 @@ public sealed class CardDefenseGame : MonoBehaviour
                         passiveDescriptionText.text += "\n11~20레벨: 작은 카드 피해 증가";
                     break;
                 case Suit.Diamond:
-                    passiveDescriptionText.text = CrealDisplayName +
+                    passiveDescriptionText.text = GetSuitDisplayName(Suit.Diamond) +
                         "\n적 명중: 속도 증가·약화(+10% 피해, 최대 3중첩/5초)";
                     if (upgradeLevels[(int)Upgrade.Creal] >= AbilityUnlockLevel)
                         passiveDescriptionText.text += "\n10레벨: 속도가 빠를수록 추가 피해\n11~20레벨: 속도 피해 강화";
@@ -1642,7 +1722,7 @@ public sealed class CardDefenseGame : MonoBehaviour
 
     private void CreateCoreHealthBar()
     {
-        coreText.enabled = false;
+        coreText.enabled = IsClassicTheme;
         RectTransform backgroundRect = CreateRect("Core Health Bar", coreRect,
             new Vector2(160f, 16f), new Vector2(0f, -82f));
         Image background = backgroundRect.gameObject.AddComponent<Image>();
